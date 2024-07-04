@@ -1,0 +1,333 @@
+---
+title: "Objective 2"
+author: "Alba Ayats Fraile"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    keep_tex: yes
+    toc: yes
+    latex_engine: xelatex
+    extra_dependencies: ["listings"]
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(repos = c(CRAN = "https://cran.rstudio.com"))
+
+# Ensure necessary libraries are installed
+if (!requireNamespace("reticulate", quietly = TRUE)) {
+  install.packages("reticulate")
+}
+if (!requireNamespace("tensorflow", quietly = TRUE)) {
+  install.packages("tensorflow")
+}
+if (!requireNamespace("keras", quietly = TRUE)) {
+  install.packages("keras")
+}
+
+# Load the libraries
+library(reticulate)
+library(tensorflow)
+library(keras)
+
+# Set the virtual environment name
+virtualenv_name <- "r-tensorflow"
+
+# Use the virtual environment
+use_virtualenv(virtualenv_name, required = TRUE)
+
+# Set random seeds for reproducibility
+set.seed(12345)
+np <- import("numpy")
+np$random$seed(as.integer(12345))
+tensorflow::set_random_seed(12345)
+```
+
+## 1. Initial exploration of the $\Delta$LK data
+
+We load the data and check for missing values to eliminate them.
+
+```{r}
+LKdata <- read.csv2("./LK_data.csv")
+head(LKdata)
+sample_number <- nrow(LKdata)
+summary(LKdata)
+```
+
+There are a total of `r sample_number` samples of nucleosomal DNA sequences and their corresponding $\Delta$LK number.
+
+```{r}
+library(psych)
+describe(LKdata$DELTALK)
+```
+
+
+## 2. Obtaining sequences from positions
+
+Using the same function from Objective 1 we will assign its correspondent sequence to each sample from the $\Delta$LK dataset.
+
+```{r message=TRUE, warning=FALSE}
+# Load the Biostrings package
+library(Biostrings)
+
+# Get the working directory
+fasta_dir <- getwd()  
+
+# List all FASTA files in the directory (same as Objective 1)
+fasta_files <- list.files(path = fasta_dir, pattern = "\\.fasta$", full.names = TRUE)
+
+# Read each FASTA file into a DNAStringSet object and store in a list
+chromosome_seqs <- setNames(
+  lapply(list.files(fasta_dir, pattern = "\\.fasta$", full.names = TRUE), readDNAStringSet),
+  sapply(list.files(fasta_dir, pattern = "\\.fasta$", full.names = FALSE), function(x) sub("\\.fasta$", "", x))
+)
+```
+
+```{r}
+extract_sequences <- function(chrom, start, end) {
+    if (chrom %in% names(chromosome_seqs)) {
+        dna_string_set <- chromosome_seqs[[chrom]]
+        sequence_length <- width(dna_string_set)[1]  # Assuming there is only one sequence
+        if (start > 0 && end <= sequence_length && start <= end) {
+            dna_sequence <- dna_string_set[[1]][start:end]  # Extracting the sequence
+            return(as.character(dna_sequence))
+        } else {
+            message(sprintf("Out of bounds: %s %d-%d of %d", chrom, start, end, sequence_length))
+            return(NA)
+        }
+    } else {
+        message(sprintf("Chromosome name not found: %s", chrom))
+        return(NA)
+    }
+}
+```
+
+```{r}
+LKdata$sequence <- mapply(extract_sequences, LKdata$CHRM, LKdata$START, LKdata$END, SIMPLIFY = FALSE)
+head(LKdata)
+```
+
+
+## 3. Prepare the data
+
+We will build a dataset with only the sequence and the $\Delta$LK number.
+
+```{r}
+LKdata <- LKdata[, c("sequence", "DELTALK")]
+head(LKdata, 3)
+```
+
+Remove NAs from the dataset:
+
+```{r}
+LKdata <- LKdata[!is.na(LKdata$sequence), ]
+```
+
+Check the longest sequence:
+
+```{r}
+sequence_lengths <- nchar(LKdata$sequence)
+max_length <- max(sequence_lengths)
+max_length
+```
+
+Encoding the sequences to integers for the input to the model and adding zeroes to those sequences shorter to the maximum length to ensure all sequences have the same length:
+
+```{r}
+encode_sequence <- function(seq, max_length) {
+  # Split the sequence into individual characters
+  seq <- strsplit(seq, "")[[1]]
+  # Map characters to integers
+  seq <- match(seq, c("A", "C", "G", "T"))
+  # Add zeros to ensure all sequences have the same length
+  c(seq, rep(0, max_length - length(seq)))
+}
+```
+
+Check the function with 2 test sequences:
+
+```{r}
+test_sequences <- c("ATCGATCGATCG", "GCTAGCTAGCTA")
+test_sequences_encoded <- t(sapply(test_sequences, encode_sequence, max_length = max_length))
+print(head(test_sequences_encoded))
+```
+
+Encode the sequences of the dataset:
+
+```{r}
+sequences_encoded <- t(sapply(LKdata$sequence, encode_sequence, max_length = max_length))
+```
+
+
+## 4. 'Training' and 'test' data split
+
+From the $\Delta$LK dataset, using the random seed of 12345, the training (80%) and test (20%) subsets are built.
+
+```{r}
+set.seed(12345)
+train_indices <- sample(1:nrow(sequences_encoded), size = 0.8 * nrow(sequences_encoded))
+sequences_train <- sequences_encoded[train_indices,]
+sequences_test <- sequences_encoded[-train_indices,]
+deltaLK_train <- LKdata$DELTALK[train_indices]
+deltaLK_test <- LKdata$DELTALK[-train_indices]
+
+# Print the number of samples in each set
+cat("Number of training samples:", nrow(sequences_train), "\n")
+cat("Number of testing samples:", nrow(sequences_test), "\n")
+```
+
+The data needs to be converted to Numpy arrays or tensors for Keras:
+
+```{r}
+library(reticulate)
+np <- import("numpy")
+
+sequences_train_np <- np$array(sequences_train, dtype = np$float32)
+deltaLK_train_np <- np$array(deltaLK_train, dtype = np$float32)
+
+sequences_test_np <- np$array(sequences_test, dtype = np$float32)
+deltaLK_test_np <- np$array(deltaLK_test, dtype = np$float32)
+```
+
+
+## 5. Build the Convolutional Neural Network (CNN) model
+
+We first need to build the model:
+
+```{r}
+set.seed(12345)
+np <- import("numpy")
+np$random$seed(as.integer(12345)) 
+tensorflow::set_random_seed(12345)
+
+embedding_dim <- 8
+
+
+model <- keras_model_sequential()
+
+# Input layer 
+model$add(layer_input(shape = c(max_length)))
+
+
+# Layers of the model with L2 regularization
+model$add(layer_embedding(input_dim = 5, output_dim = embedding_dim))
+model$add(layer_conv_1d(filters = 128, kernel_size = 3, activation = 'relu', 
+                        kernel_regularizer = keras$regularizers$l2(0.01)))
+model$add(layer_max_pooling_1d(pool_size = 2))
+model$add(layer_dropout(rate = 0.5))
+
+model$add(layer_conv_1d(filters = 256, kernel_size = 3, activation = 'relu', 
+                        kernel_regularizer = keras$regularizers$l2(0.01)))
+model$add(layer_max_pooling_1d(pool_size = 2))
+model$add(layer_dropout(rate = 0.5))
+
+model$add(layer_flatten())
+model$add(layer_dense(units = 256, activation = 'relu', 
+                      kernel_regularizer = keras$regularizers$l2(0.01)))
+model$add(layer_dropout(rate = 0.5))
+model$add(layer_dense(units = 128, activation = 'relu', 
+                      kernel_regularizer = keras$regularizers$l2(0.01)))
+model$add(layer_dropout(rate = 0.5))
+model$add(layer_dense(units = 1))
+
+# Compile the model 
+model$compile(
+  optimizer = optimizer_adam(learning_rate = 0.0001),
+  loss = 'mse',
+  metrics = list('mean_absolute_error', 'mean_squared_error')
+)
+
+print("Model compiled successfully")
+
+# Model summary
+# model_summary <- capture.output(model$summary())
+# cat(paste(model_summary, collapse = "\n"))
+```
+
+
+## 6. Model Training
+
+```{r}
+early_stop <- callback_early_stopping(
+  monitor = 'val_loss', 
+  patience = 10, 
+  restore_best_weights = TRUE
+)
+
+batch_size <- as.integer(16)
+epochs <- as.integer(30)
+validation_split <- as.numeric(0.2)
+
+print("Starting model training")
+```
+
+```{r}
+history <- model$fit(
+  x = sequences_train_np, 
+  y = deltaLK_train_np,  
+  epochs = epochs,
+  batch_size = batch_size,
+  validation_split = validation_split,
+  callbacks = list(early_stop),
+  verbose=0
+)
+
+print("Model training completed")
+```
+
+To visualize the model training we can plot the training process:
+
+```{r warning=FALSE}
+library(ggplot2)
+
+# Convert to dataframe
+history_df <- as.data.frame(history$history)
+history_df$epoch <- seq_len(nrow(history_df))
+
+# Loss
+ggplot(history_df, aes(x = epoch)) +
+  geom_line(aes(y = loss, color = "Training Loss")) +
+  geom_line(aes(y = val_loss, color = "Validation Loss")) +
+  labs(title = "Model Loss over Epochs", x = "Epoch", y = "Loss") +
+  theme_minimal()
+
+# Mean Absolute Error (MAE)
+ggplot(history_df, aes(x = epoch)) +
+  geom_line(aes(y = mean_absolute_error, color = "Training MAE")) +
+  geom_line(aes(y = val_mean_absolute_error, color = "Validation MAE")) +
+  labs(title = "Model MAE over Epochs", x = "Epoch", y = "Mean Absolute Error") +
+  theme_minimal()
+```
+
+
+## 7. Model Evaluation with the test dataset
+
+We evaluate the model with the test dataset and print the metrics:
+
+```{r}
+test_metrics <- model$evaluate(sequences_test_np, deltaLK_test_np, verbose=0)
+print(test_metrics)
+```
+
+We can also make predictions of the test dataset and compare them to the actual values to further evaluate the model performance:
+
+```{r}
+predictions <- model$predict(sequences_test_np, verbose=0)
+
+# Compare predictions to actual values
+comparison <- data.frame(
+  Actual = deltaLK_test_np,
+  Predicted = predictions
+)
+
+print(head(comparison, 20))
+```
+
+And plot these predictions:
+
+```{r}
+# Plot actual vs. predicted values
+plot(deltaLK_test_np, predictions, main = "Actual vs. Predicted Values", xlab = "Actual Values", ylab = "Predicted Values", pch = 20, col = "blue")
+abline(0, 1, col = "red")  
+```
+
