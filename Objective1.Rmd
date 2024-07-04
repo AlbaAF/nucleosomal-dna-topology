@@ -1,0 +1,366 @@
+---
+title: "Objective 1: DNA Motifs in Nucleosomal Sequences"
+author: "Alba Ayats Fraile"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    keep_tex: yes
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Download chromosome sequences from NCBI
+
+## 1.1. Install necessary packages
+
+```{r warning=FALSE}
+# Install if necessary
+if (!requireNamespace("rentrez", quietly = TRUE)) {
+  install.packages("rentrez")
+}
+if (!requireNamespace("Biostrings", quietly = TRUE)) {
+    if (!requireNamespace("BiocManager", quietly = TRUE))
+        install.packages("BiocManager")
+    BiocManager::install("Biostrings")
+}
+
+if (!requireNamespace("universalmotif", quietly = TRUE)) {
+    BiocManager::install("universalmotif")
+}
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+library(Biostrings)
+library(dplyr)
+library(rentrez)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(ComplexHeatmap)
+```
+
+## 1.2. Download the chromosome sequences using the RefSeq accession numbers
+
+We will use the Genome assembly R64 (NCBI RefSeq assembly GCF_000146045.2), from Saccharomyces cerevisiae S288C, a strain of brewer's yeast (Saccharomyces cerevisiae) which is widely used. We will download each chromosome FASTA sequence individually since out positioning data is by chromosome.
+
+```{r}
+# List of RefSeq accession numbers for each chromosome
+refseq_ids <- c("NC_001133.9", "NC_001134.8", "NC_001135.5", "NC_001136.10",
+                "NC_001137.3", "NC_001138.5", "NC_001139.9", "NC_001140.6",
+                "NC_001141.2", "NC_001142.9", "NC_001143.9", "NC_001144.5",
+                "NC_001145.3", "NC_001146.8", "	NC_001147.6", "NC_001148.4")
+
+# Loop through each RefSeq ID to download the FASTA sequence using 'entrez_fetch'
+for (id in refseq_ids) {
+  fasta_sequence <- entrez_fetch(db = "nucleotide", 
+                                 id = id, 
+                                 rettype = "fasta", 
+                                 retmode = "text")
+  
+  # Name the file according to the first line of the file
+  first_line <- strsplit(fasta_sequence, "\n")[[1]][1]
+  chr_name <- sub(".*chromosome (.*?), complete sequence.*", "\\1", first_line)
+  file_name <- sprintf("chr%s.fasta", chr_name)
+  
+  # Write the sequence to a file
+  writeLines(fasta_sequence, file_name)
+}
+```
+
+
+## 1.3. Load the downloaded chromosome sequences into R and check the process
+
+```{r message=FALSE, warning=FALSE}
+# Install Biostrings using BiocManager if necessary
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("Biostrings")
+
+# Load the Biostrings package
+library(Biostrings)
+
+# Get the working directory
+fasta_dir <- getwd()  
+
+# List all FASTA files in the directory
+fasta_files <- list.files(path = fasta_dir, pattern = "\\.fasta$", full.names = TRUE)
+
+# Read each FASTA file into a DNAStringSet object and store in a list
+chromosome_seqs <- setNames(
+  lapply(list.files(fasta_dir, pattern = "\\.fasta$", full.names = TRUE), readDNAStringSet),
+  sapply(list.files(fasta_dir, pattern = "\\.fasta$", full.names = FALSE), function(x) sub("\\.fasta$", "", x))
+)
+
+# Print the length and name of each chromosome sequence
+chrom_lengths <- sapply(chromosome_seqs, width)
+print(chrom_lengths)
+```
+
+
+# 2. Load and filter the data of nucleosome positioning (Supplementary Data from Jiang C, Pugh BF, 2009)
+
+```{r}
+# Load the data
+position_data <- read.csv2("./PughData.csv",stringsAsFactors = FALSE)
+head(position_data)
+```
+
+```{r}
+# Change chromosome names to roman numbers (same as NCBI data) 
+name_conversion <- setNames(
+  paste0("chr", as.roman(1:16)),  
+  paste0("chr", sprintf("%02d", 1:16)))
+
+position_data$chrom <- name_conversion[position_data$chrom]
+head(position_data$chrom)
+```
+
+Verify start and end positions:
+
+```{r}
+# Add a check to see if any positions are out of range
+position_data$valid_range <- mapply(function(chrom, start, end) {
+  if(chrom %in% names(chromosome_seqs)) {
+    seq_length <- width(chromosome_seqs[[chrom]])
+    return(start > 0 & end <= seq_length & start <= end)
+  } else {
+    return(FALSE)
+  }
+}, position_data$chrom, position_data$start, position_data$end)
+
+# Check how many are invalid
+sum(!position_data$valid_range)
+
+# Remove the ones that are invalid
+position_data <- position_data[position_data$valid_range, ]
+```
+
+Remove and filter the data, since we are only interested in those that have a known position relative to the TSS we will only proceed with those:
+
+```{r message=FALSE, warning=FALSE}
+if (!require("dplyr")) install.packages("dplyr")
+if (!require("stringr")) install.packages("stringr")
+
+library(dplyr)
+library(stringr)
+```
+
+```{r}
+# Filtering the position data
+position_data <- position_data %>%
+  filter(position != "") %>%  # Ensure that position values are not empty
+  filter(!str_detect(position, ";\\s*[^\\s]+")) %>%  # Keep rows with only one entry
+  mutate(position = case_when(
+    str_detect(position, "\\*") ~ "*",  
+    TRUE ~ str_extract(position, "^([+-]?\\d+)") 
+  ))
+  
+print(head(position_data))
+```
+
+
+# 3. Function to extract the sequences
+
+We want to extract the sequences from the NCBI chromosome sequences using the positioning from the Supplementary Data of Pugh, 2009. For this we will build a function that iteratively uses the start and end positions and adds the sequence to the dataframe (called 'position_data').
+
+```{r}
+extract_sequences <- function(chrom, start, end) {
+    if (chrom %in% names(chromosome_seqs)) {
+        dna_string_set <- chromosome_seqs[[chrom]]
+        sequence_length <- width(dna_string_set)[1]  # Assuming there is only one sequence
+        if (start > 0 && end <= sequence_length && start <= end) {
+            dna_sequence <- dna_string_set[[1]][start:end]  # Extracting the sequence
+            return(as.character(dna_sequence))
+        } else {
+            message(sprintf("Out of bounds: %s %d-%d of %d", chrom, start, end, sequence_length))
+            return(NA)
+        }
+    } else {
+        message(sprintf("Chromosome name not found: %s", chrom))
+        return(NA)
+    }
+}
+```
+
+Before using it for extracting all the sequence we will do a small test for the function:
+
+```{r}
+# Testing the function with a sample range known to be valid
+test_chrom = "chrI"  
+test_start = 1
+test_end = 10
+print(extract_sequences(test_chrom, test_start, test_end))
+
+# Check for the sequence
+print(chromosome_seqs[[1]])
+```
+Once we tested the function we proceed to extract all the nucleosomal sequences and adding them as a new column to our exsiting dataframe:
+
+```{r}
+# Apply the function for each position
+position_data$sequence <- mapply(extract_sequences, position_data$chrom, position_data$start, position_data$end, SIMPLIFY = FALSE)
+
+# Check the output
+print(head(position_data$sequence, 4))
+```
+
+
+# 4. k-mer search for DNA sequence patterns by groups (TSS position)
+
+Pre-process the data by converting the sequences to DNAStringSet objects and removing the groups (the positions of the nucleosomes relative to the TSS of the gene) that contain less than 5 sequences:
+
+```{r}
+converted_sequences <- position_data %>%
+  mutate(sequence = lapply(sequence, function(seq) {
+    if (!is(seq, "DNAStringSet")) {
+      return(DNAStringSet(sapply(seq, DNAString)))
+    }
+    return(seq)
+  }))
+
+converted_sequences <- converted_sequences %>%
+  filter(!sapply(sequence, is.null))
+```
+
+```{r}
+# Group by 'position' and remove groups with less than 5 sequences
+converted_sequences <- converted_sequences %>%
+  group_by(position) %>%
+  filter(n() >= 5)
+
+# Check the different positions
+print(unique(converted_sequences$position))
+```
+
+Check the different groups obtained:
+
+```{r}
+# Check the total number of sequences for each position
+position_summary <- converted_sequences %>%
+    group_by(position) %>%
+    summarize(total = n())
+
+print(head(position_summary))
+```
+
+To search for patterns that define the groups we will build a function to count k-mers:
+
+```{r}
+# Function
+count_kmers <- function(sequence, k) {
+  kmer_counts <- oligonucleotideFrequency(sequence, width = k)
+  kmer_counts_df <- as.data.frame(t(kmer_counts))
+  kmer_counts_df$kmer <- rownames(kmer_counts_df)
+  kmer_counts_df <- kmer_counts_df %>%
+    pivot_longer(cols = -kmer, names_to = "sample", values_to = "count") %>%
+    group_by(kmer) %>%
+    summarise(total_count = sum(count))
+  return(kmer_counts_df)
+}
+```
+
+
+```{r}
+# Define k-mer length
+k <- 6
+
+kmer_list <- list()
+
+# Iterate over each position group
+for (pos in unique(converted_sequences$position)) {
+  # Subset the data for the current position
+  pos_data <- converted_sequences %>%
+    filter(position == pos)
+  
+  # Ensure sequences are DNAStringSet objects
+  pos_sequences <- do.call(c, lapply(pos_data$sequence, as.character))
+  pos_sequences <- DNAStringSet(pos_sequences)  
+  
+  # Count k-mers for the sequences in the current group
+  kmer_counts <- count_kmers(pos_sequences, k)
+  
+  # Add position information
+  kmer_counts$position <- pos
+  
+  # Store the result in the list
+  kmer_list[[as.character(pos)]] <- kmer_counts
+}
+
+# Combine all k-mer counts into a single data frame
+kmer_counts_combined <- bind_rows(kmer_list)
+
+# Summarize the k-mer counts by position
+kmer_summary_by_position <- kmer_counts_combined %>%
+  pivot_wider(names_from = position, values_from = total_count, values_fill = 0)
+
+# Print the summarized k-mer counts by position
+print(head(kmer_summary_by_position))
+```
+
+```{r}
+library(ComplexHeatmap)
+
+# Convert to matrix for heatmap
+kmer_matrix <- as.matrix(kmer_summary_by_position[,-1])
+rownames(kmer_matrix) <- kmer_summary_by_position$kmer
+
+# Plot heatmap
+Heatmap(kmer_matrix, name = "k-mer count", 
+        column_title = "Position", 
+        row_title = "k-mer", 
+        show_row_names = FALSE, 
+        show_column_names = TRUE)
+```
+
+From the k-mer results we can further analyse them by performing a Principal Component Analysis:
+
+```{r}
+pca_result <- prcomp(t(kmer_matrix), scale. = TRUE)
+
+pca_data <- data.frame(
+  Position = colnames(kmer_matrix),
+  PC1 = pca_result$x[,1],
+  PC2 = pca_result$x[,2]
+)
+
+# Plot PCA
+ggplot(pca_data, aes(x = PC1, y = PC2, label = Position)) +
+  geom_point() +
+  geom_text(vjust = 1.5, size = 3) +
+  ggtitle("PCA of k-mer Counts by Position") +
+  xlab("Principal Component 1") +
+  ylab("Principal Component 2")
+```
+
+```{r}
+# Calculate the contribution of each k-mer to the principal components
+loadings <- pca_result$rotation
+
+# Identify the top contributing k-mers for PC1 and PC2
+top_kmers_pc1 <- loadings[order(abs(loadings[, 1]), decreasing = TRUE), ]
+top_kmers_pc2 <- loadings[order(abs(loadings[, 2]), decreasing = TRUE), ]
+
+# Print the top contributing k-mers
+print(top_kmers_pc1[1:10, ])
+print(top_kmers_pc2[1:10, ])
+```
+
+```{r}
+# Perform k-means clustering on the PCA results
+set.seed(123)  # For reproducibility
+kmeans_result <- kmeans(pca_result$x[, 1:2], centers = 5)  # Example with 3 clusters
+
+# Add cluster information to the PCA data
+pca_data$cluster <- as.factor(kmeans_result$cluster)
+
+# Plot the PCA with clusters
+ggplot(pca_data, aes(x = PC1, y = PC2, color = cluster)) +
+    geom_point() +
+    ggtitle("PCA of k-mer Counts by Position with Clusters")
+```
+
